@@ -12,6 +12,10 @@
 #include <Preferences.h>
 #include <base64.h>
 #include <MD5Builder.h>
+#include <mbedtls/md.h>
+struct ConcatSms;
+#include <stdarg.h>
+#include <esp_idf_version.h>
 
 // 看门狗超时（秒）
 #define WDT_TIMEOUT_SEC 60
@@ -38,6 +42,49 @@
 #ifndef SIM_SLOT
 #define SIM_SLOT 1
 #endif
+
+// 上游功能按固定容量实现，避免在资源有限的 ESP32-C3 上保留大量 String。
+#ifndef MODEM_EN_PIN
+#define MODEM_EN_PIN 5
+#endif
+#ifndef MAX_PUSH_CHANNELS
+#define MAX_PUSH_CHANNELS 3
+#endif
+#ifndef WEB_LOG_SIZE
+#define WEB_LOG_SIZE 3072
+#endif
+#ifndef MAX_CONCAT_MESSAGES
+#define MAX_CONCAT_MESSAGES 2
+#endif
+#ifndef MAX_CONCAT_PARTS
+#define MAX_CONCAT_PARTS 8
+#endif
+#ifndef CONCAT_PART_TEXT_LEN
+#define CONCAT_PART_TEXT_LEN 192
+#endif
+#define CONCAT_TIMEOUT_MS 30000UL
+#if MAX_PUSH_CHANNELS > 16
+#error "MAX_PUSH_CHANNELS must not exceed 16 (retry state uses a uint16_t bitmask)"
+#endif
+#if MAX_CONCAT_PARTS > 8
+#error "MAX_CONCAT_PARTS must not exceed 8 (concat state uses a uint8_t bitmask)"
+#endif
+
+enum PushType : uint8_t {
+  PUSH_NONE = 0, PUSH_POST_JSON, PUSH_BARK, PUSH_GET, PUSH_DINGTALK,
+  PUSH_PUSHPLUS, PUSH_SERVERCHAN, PUSH_CUSTOM, PUSH_FEISHU, PUSH_GOTIFY,
+  PUSH_TELEGRAM
+};
+
+struct PushChannelConfig {
+  bool enabled;
+  uint8_t type;
+  char name[24];
+  char url[192];
+  char key1[96];
+  char key2[96];
+  char customBody[256];
+};
 
 // Web 服务器端口
 #define WEB_SERVER_PORT 80
@@ -75,6 +122,9 @@ struct RuntimeConfig {
   bool smsWebMode;
   char webUser[32];
   char webPass[32];
+  char adminPhone[32];
+  char numberBlacklist[256];
+  PushChannelConfig pushChannels[MAX_PUSH_CHANNELS];
 } rtConfig;
 
 //串口映射
@@ -223,11 +273,12 @@ struct SMSItem {
   bool wecomSent;
   bool emailSent;
   bool httpSent;
+  uint16_t pushSentMask;
 };
 
 // 函数前向声明（解决编译顺序问题）
 void enqueueSMS(const char* sender, const char* text, const char* timestamp);
-void enqueueSMSWithStatus(const char* sender, const char* text, const char* timestamp, bool wecomOk, bool emailOk, bool httpOk);
+void enqueueSMSWithStatus(const char* sender, const char* text, const char* timestamp, bool wecomOk, bool emailOk, bool httpOk, uint16_t pushMask = 0);
 void removeHeadSMS();
 bool trySendChannels(SMSItem &item);  // 改为非const，需要更新状态
 void processSMSQueue();
@@ -240,6 +291,11 @@ bool checkAuth();
 bool sendSMS(const char* phoneNumber, const char* message);
 String htmlEncode(const String& str);
 void processReceivedSMS(const char* sender, const char* text, const char* timestamp);
+void processReceivedSegment(const char* sender, const char* text, const char* timestamp,
+                            uint16_t reference, uint8_t part, uint8_t total);
+void checkConcatTimeouts();
+bool resetModem();
+String sendATCommand(const char* command, unsigned long timeout = 3000);
 void handleCtrl();
 bool sendSmsWebDeviceEvent(uint16_t type);
 
@@ -256,8 +312,81 @@ unsigned long bootTime = 0;
 unsigned long lastSmsWebHeartbeat = 0;
 #define SMS_WEB_HEARTBEAT_MS 120000UL
 
+// 网页日志使用覆盖式环形缓冲；固定占用，不随运行时间增长。
+char webLog[WEB_LOG_SIZE];
+size_t webLogHead = 0;
+size_t webLogLength = 0;
+
+void logLine(const char* format, ...) {
+  char line[256];
+  va_list args;
+  va_start(args, format);
+  vsnprintf(line, sizeof(line), format, args);
+  va_end(args);
+  Serial.println(line);
+  size_t length = strnlen(line, sizeof(line));
+  for (size_t i = 0; i < length; ++i) {
+    webLog[webLogHead] = line[i];
+    webLogHead = (webLogHead + 1) % WEB_LOG_SIZE;
+    if (webLogLength < WEB_LOG_SIZE) ++webLogLength;
+  }
+  webLog[webLogHead] = '\n';
+  webLogHead = (webLogHead + 1) % WEB_LOG_SIZE;
+  if (webLogLength < WEB_LOG_SIZE) ++webLogLength;
+}
+
+String getWebLog() {
+  String result;
+  result.reserve(webLogLength + 1);
+  size_t start = (webLogHead + WEB_LOG_SIZE - webLogLength) % WEB_LOG_SIZE;
+  for (size_t i = 0; i < webLogLength; ++i) result += webLog[(start + i) % WEB_LOG_SIZE];
+  return result;
+}
+
+struct ConcatSms {
+  bool used;
+  uint16_t reference;
+  uint8_t total;
+  uint8_t received;
+  uint8_t presentMask;
+  unsigned long startedAt;
+  char sender[SMS_SENDER_LEN];
+  char timestamp[SMS_TIMESTAMP_LEN];
+  char parts[MAX_CONCAT_PARTS][CONCAT_PART_TEXT_LEN];
+};
+ConcatSms concatMessages[MAX_CONCAT_MESSAGES];
+
+void loadPushChannelsFromNvs() {
+  char key[12];
+  for (uint8_t i = 0; i < MAX_PUSH_CHANNELS; ++i) {
+    PushChannelConfig &ch = rtConfig.pushChannels[i];
+    snprintf(key, sizeof(key), "p%ue", i); ch.enabled = preferences.getBool(key, ch.enabled);
+    snprintf(key, sizeof(key), "p%ut", i); ch.type = preferences.getUChar(key, ch.type);
+    snprintf(key, sizeof(key), "p%un", i); strlcpy(ch.name, preferences.getString(key, ch.name).c_str(), sizeof(ch.name));
+    snprintf(key, sizeof(key), "p%uu", i); strlcpy(ch.url, preferences.getString(key, ch.url).c_str(), sizeof(ch.url));
+    snprintf(key, sizeof(key), "p%ua", i); strlcpy(ch.key1, preferences.getString(key, ch.key1).c_str(), sizeof(ch.key1));
+    snprintf(key, sizeof(key), "p%ub", i); strlcpy(ch.key2, preferences.getString(key, ch.key2).c_str(), sizeof(ch.key2));
+    snprintf(key, sizeof(key), "p%uc", i); strlcpy(ch.customBody, preferences.getString(key, ch.customBody).c_str(), sizeof(ch.customBody));
+  }
+}
+
+void savePushChannelsToNvs() {
+  char key[12];
+  for (uint8_t i = 0; i < MAX_PUSH_CHANNELS; ++i) {
+    const PushChannelConfig &ch = rtConfig.pushChannels[i];
+    snprintf(key, sizeof(key), "p%ue", i); preferences.putBool(key, ch.enabled);
+    snprintf(key, sizeof(key), "p%ut", i); preferences.putUChar(key, ch.type);
+    snprintf(key, sizeof(key), "p%un", i); preferences.putString(key, ch.name);
+    snprintf(key, sizeof(key), "p%uu", i); preferences.putString(key, ch.url);
+    snprintf(key, sizeof(key), "p%ua", i); preferences.putString(key, ch.key1);
+    snprintf(key, sizeof(key), "p%ub", i); preferences.putString(key, ch.key2);
+    snprintf(key, sizeof(key), "p%uc", i); preferences.putString(key, ch.customBody);
+  }
+}
+
 // ==================== 持久化配置函数 ====================
 void loadCompileTimeDefaults() {
+  memset(&rtConfig, 0, sizeof(rtConfig));
   strlcpy(rtConfig.wecomUrl, WECHAT_WEBHOOK_URL, sizeof(rtConfig.wecomUrl));
   strlcpy(rtConfig.simNumber, LOCAL_SIM_NUMBER, sizeof(rtConfig.simNumber));
   strlcpy(rtConfig.smtpServer, SMTP_SERVER, sizeof(rtConfig.smtpServer));
@@ -303,6 +432,9 @@ void loadConfig() {
   rtConfig.smsWebMode = preferences.getBool("smsWeb", HTTP_SMS_WEB_MODE);
   strlcpy(rtConfig.webUser, preferences.getString("webUser", WEB_ADMIN_USER).c_str(), sizeof(rtConfig.webUser));
   strlcpy(rtConfig.webPass, preferences.getString("webPass", WEB_ADMIN_PASS).c_str(), sizeof(rtConfig.webPass));
+  strlcpy(rtConfig.adminPhone, preferences.getString("adminPhone", "").c_str(), sizeof(rtConfig.adminPhone));
+  strlcpy(rtConfig.numberBlacklist, preferences.getString("blacklist", "").c_str(), sizeof(rtConfig.numberBlacklist));
+  loadPushChannelsFromNvs();
   
   preferences.end();
   Serial.println("配置已从 NVS 加载");
@@ -327,7 +459,20 @@ bool verifyStoredConfig() {
     preferences.getBool("enHttp", !rtConfig.enableHttp) == rtConfig.enableHttp &&
     preferences.getBool("smsWeb", !rtConfig.smsWebMode) == rtConfig.smsWebMode &&
     preferences.getString("webUser", "") == rtConfig.webUser &&
-    preferences.getString("webPass", "") == rtConfig.webPass;
+    preferences.getString("webPass", "") == rtConfig.webPass &&
+    preferences.getString("adminPhone", "") == rtConfig.adminPhone &&
+    preferences.getString("blacklist", "") == rtConfig.numberBlacklist;
+  char key[12];
+  for (uint8_t i = 0; ok && i < MAX_PUSH_CHANNELS; ++i) {
+    const PushChannelConfig &ch = rtConfig.pushChannels[i];
+    snprintf(key, sizeof(key), "p%ue", i); ok = preferences.getBool(key, !ch.enabled) == ch.enabled;
+    snprintf(key, sizeof(key), "p%ut", i); ok = ok && preferences.getUChar(key, 255) == ch.type;
+    snprintf(key, sizeof(key), "p%un", i); ok = ok && preferences.getString(key, "") == ch.name;
+    snprintf(key, sizeof(key), "p%uu", i); ok = ok && preferences.getString(key, "") == ch.url;
+    snprintf(key, sizeof(key), "p%ua", i); ok = ok && preferences.getString(key, "") == ch.key1;
+    snprintf(key, sizeof(key), "p%ub", i); ok = ok && preferences.getString(key, "") == ch.key2;
+    snprintf(key, sizeof(key), "p%uc", i); ok = ok && preferences.getString(key, "") == ch.customBody;
+  }
   preferences.end();
   return ok;
 }
@@ -339,23 +484,26 @@ bool saveConfig() {
   }
 
   bool ok = true;
-  ok = preferences.putString("wecomUrl", rtConfig.wecomUrl) > 0 && ok;
-  ok = preferences.putString("simNumber", rtConfig.simNumber) > 0 && ok;
-  ok = preferences.putString("smtpServer", rtConfig.smtpServer) > 0 && ok;
+  preferences.putString("wecomUrl", rtConfig.wecomUrl);
+  preferences.putString("simNumber", rtConfig.simNumber);
+  preferences.putString("smtpServer", rtConfig.smtpServer);
   ok = preferences.putUShort("smtpPort", rtConfig.smtpPort) > 0 && ok;
-  ok = preferences.putString("smtpUser", rtConfig.smtpUser) > 0 && ok;
-  ok = preferences.putString("smtpPass", rtConfig.smtpPass) > 0 && ok;
-  ok = preferences.putString("smtpTo", rtConfig.smtpTo) > 0 && ok;
-  ok = preferences.putString("httpUrl", rtConfig.httpServerUrl) > 0 && ok;
-  ok = preferences.putString("httpKey", rtConfig.httpApiKey) > 0 && ok;
-  ok = preferences.putString("deviceId", rtConfig.deviceId) > 0 && ok;
+  preferences.putString("smtpUser", rtConfig.smtpUser);
+  preferences.putString("smtpPass", rtConfig.smtpPass);
+  preferences.putString("smtpTo", rtConfig.smtpTo);
+  preferences.putString("httpUrl", rtConfig.httpServerUrl);
+  preferences.putString("httpKey", rtConfig.httpApiKey);
+  preferences.putString("deviceId", rtConfig.deviceId);
   ok = preferences.putUChar("simSlot", rtConfig.simSlot) > 0 && ok;
   ok = preferences.putBool("enWecom", rtConfig.enableWecom) > 0 && ok;
   ok = preferences.putBool("enEmail", rtConfig.enableEmail) > 0 && ok;
   ok = preferences.putBool("enHttp", rtConfig.enableHttp) > 0 && ok;
   ok = preferences.putBool("smsWeb", rtConfig.smsWebMode) > 0 && ok;
-  ok = preferences.putString("webUser", rtConfig.webUser) > 0 && ok;
-  ok = preferences.putString("webPass", rtConfig.webPass) > 0 && ok;
+  preferences.putString("webUser", rtConfig.webUser);
+  preferences.putString("webPass", rtConfig.webPass);
+  preferences.putString("adminPhone", rtConfig.adminPhone);
+  preferences.putString("blacklist", rtConfig.numberBlacklist);
+  savePushChannelsToNvs();
   preferences.end();
 
   if (ok) ok = verifyStoredConfig();
@@ -473,6 +621,141 @@ bool postHttpJson(String& jsonData) {
     Serial.printf("HTTP 响应码: %d\n", httpCode);
   }
   http.end();
+  return ok;
+}
+
+String urlEncode(const char* value) {
+  static const char hex[] = "0123456789ABCDEF";
+  String result;
+  result.reserve(strlen(value) * 2);
+  while (*value) {
+    uint8_t c = (uint8_t)*value++;
+    if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') result += (char)c;
+    else {
+      result += '%';
+      result += hex[c >> 4];
+      result += hex[c & 15];
+    }
+  }
+  return result;
+}
+
+String hmacSha256Base64(const String& secret, const String& message) {
+  uint8_t digest[32];
+  mbedtls_md_context_t context;
+  mbedtls_md_init(&context);
+  const mbedtls_md_info_t* info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+  if (!info || mbedtls_md_setup(&context, info, 1) != 0) {
+    mbedtls_md_free(&context);
+    return "";
+  }
+  mbedtls_md_hmac_starts(&context, (const unsigned char*)secret.c_str(), secret.length());
+  mbedtls_md_hmac_update(&context, (const unsigned char*)message.c_str(), message.length());
+  mbedtls_md_hmac_finish(&context, digest);
+  mbedtls_md_free(&context);
+  return base64::encode(digest, sizeof(digest));
+}
+
+bool isPushChannelValid(const PushChannelConfig& channel) {
+  if (!channel.enabled || channel.type == PUSH_NONE || channel.type > PUSH_TELEGRAM) return false;
+  if ((channel.type == PUSH_PUSHPLUS || channel.type == PUSH_SERVERCHAN) && !channel.key1[0]) return false;
+  if (channel.type == PUSH_TELEGRAM && (!channel.key1[0] || !channel.key2[0])) return false;
+  if (channel.type == PUSH_GOTIFY && (!channel.url[0] || !channel.key1[0])) return false;
+  return channel.url[0] || channel.type == PUSH_PUSHPLUS || channel.type == PUSH_SERVERCHAN || channel.type == PUSH_TELEGRAM;
+}
+
+bool sendPushChannel(const PushChannelConfig& channel, const char* sender,
+                     const char* message, const char* timestamp) {
+  if (!isPushChannelValid(channel)) return true;
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  String senderJson = escapeJson(sender);
+  String messageJson = escapeJson(message);
+  String timeJson = escapeJson(timestamp ? timestamp : "");
+  String url = channel.url;
+  String body;
+  String contentType = "application/json";
+  bool useGet = false;
+
+  switch ((PushType)channel.type) {
+    case PUSH_POST_JSON:
+      body = "{\"sender\":\"" + senderJson + "\",\"message\":\"" + messageJson + "\",\"timestamp\":\"" + timeJson + "\"}";
+      break;
+    case PUSH_BARK:
+      body = "{\"title\":\"" + senderJson + "\",\"body\":\"" + messageJson + "\"}";
+      break;
+    case PUSH_GET:
+      url += (url.indexOf('?') >= 0 ? '&' : '?');
+      url += "sender=" + urlEncode(sender) + "&message=" + urlEncode(message) + "&timestamp=" + urlEncode(timestamp ? timestamp : "");
+      useGet = true;
+      break;
+    case PUSH_DINGTALK: {
+      if (channel.key1[0]) {
+        int64_t ms = (int64_t)time(nullptr) * 1000LL;
+        String sign = hmacSha256Base64(channel.key1, String(ms) + "\n" + channel.key1);
+        url += (url.indexOf('?') >= 0 ? '&' : '?');
+        url += "timestamp=" + String(ms) + "&sign=" + urlEncode(sign.c_str());
+      }
+      body = "{\"msgtype\":\"text\",\"text\":{\"content\":\"短信来自: " + senderJson + "\\n" + messageJson + "\\n" + timeJson + "\"}}";
+      break;
+    }
+    case PUSH_PUSHPLUS:
+      url = channel.url[0] ? channel.url : "https://www.pushplus.plus/send";
+      body = "{\"token\":\"" + escapeJson(channel.key1) + "\",\"title\":\"短信来自: " + senderJson + "\",\"content\":\"" + messageJson + "\\n" + timeJson + "\"";
+      if (channel.key2[0]) body += ",\"channel\":\"" + escapeJson(channel.key2) + "\"";
+      body += "}";
+      break;
+    case PUSH_SERVERCHAN:
+      if (!url.length()) url = "https://sctapi.ftqq.com/" + String(channel.key1) + ".send";
+      contentType = "application/x-www-form-urlencoded";
+      body = "title=" + urlEncode(("短信来自: " + String(sender)).c_str());
+      body += "&desp=" + urlEncode((String(message) + "\n\n" + (timestamp ? timestamp : "")).c_str());
+      break;
+    case PUSH_CUSTOM:
+      body = channel.customBody;
+      body.replace("{sender}", senderJson);
+      body.replace("{message}", messageJson);
+      body.replace("{timestamp}", timeJson);
+      break;
+    case PUSH_FEISHU: {
+      body = "{";
+      if (channel.key1[0]) {
+        time_t seconds = time(nullptr);
+        String sign = hmacSha256Base64(String(seconds) + "\n" + channel.key1, "");
+        body += "\"timestamp\":\"" + String(seconds) + "\",\"sign\":\"" + sign + "\",";
+      }
+      body += "\"msg_type\":\"text\",\"content\":{\"text\":\"短信来自: " + senderJson + "\\n" + messageJson + "\\n" + timeJson + "\"}}";
+      break;
+    }
+    case PUSH_GOTIFY:
+      if (!url.endsWith("/")) url += '/';
+      url += "message?token=" + urlEncode(channel.key1);
+      body = "{\"title\":\"短信来自: " + senderJson + "\",\"message\":\"" + messageJson + "\\n" + timeJson + "\",\"priority\":5}";
+      break;
+    case PUSH_TELEGRAM:
+      if (!url.length()) url = "https://api.telegram.org";
+      if (url.endsWith("/")) url.remove(url.length() - 1);
+      url += "/bot" + String(channel.key2) + "/sendMessage";
+      body = "{\"chat_id\":\"" + escapeJson(channel.key1) + "\",\"text\":\"短信来自: " + senderJson + "\\n" + messageJson + "\\n" + timeJson + "\"}";
+      break;
+    default:
+      return true;
+  }
+
+  HTTPClient http;
+  http.setTimeout(HTTP_TIMEOUT_MS);
+  http.setConnectTimeout(HTTP_TIMEOUT_MS);
+  if (!http.begin(url)) return false;
+  http.useHTTP10(true);
+  int status;
+  if (useGet) status = http.GET();
+  else {
+    http.addHeader("Content-Type", contentType);
+    status = http.POST(body);
+  }
+  http.end();
+  bool ok = status >= 200 && status < 300;
+  logLine("推送通道[%s] HTTP=%d", channel.name[0] ? channel.name : "未命名", status);
   return ok;
 }
 
@@ -661,10 +944,158 @@ bool isHexString(const String& str) {
   return true;
 }
 
+String normalizedPhone(const char* phone) {
+  String value = phone ? phone : "";
+  value.trim();
+  if (value.startsWith("+86")) value.remove(0, 3);
+  return value;
+}
+
+bool isBlacklisted(const char* sender) {
+  String target = normalizedPhone(sender);
+  const char* cursor = rtConfig.numberBlacklist;
+  while (*cursor) {
+    while (*cursor == '\n' || *cursor == '\r' || *cursor == ',' || *cursor == ' ') ++cursor;
+    const char* end = cursor;
+    while (*end && *end != '\n' && *end != '\r' && *end != ',') ++end;
+    String entry(cursor, end - cursor);
+    entry.trim();
+    if (normalizedPhone(entry.c_str()) == target && target.length()) return true;
+    cursor = end;
+  }
+  return false;
+}
+
+bool resetModem() {
+  logLine("正在通过 GPIO%d 硬重启模组", MODEM_EN_PIN);
+  digitalWrite(MODEM_EN_PIN, LOW);
+  delay(1500);
+  digitalWrite(MODEM_EN_PIN, HIGH);
+  delay(5000);
+  bool ok = sendATandWaitOK("AT", 3000);
+  if (ok) {
+    sendATandWaitOK("AT+CNMI=2,2,0,0,0", 2000);
+    sendATandWaitOK("AT+CMGF=0", 2000);
+  }
+  logLine("模组硬重启%s", ok ? "完成" : "后无响应");
+  return ok;
+}
+
+bool handleAdminSms(const char* sender, const char* text) {
+  if (!rtConfig.adminPhone[0] || normalizedPhone(sender) != normalizedPhone(rtConfig.adminPhone)) return false;
+  String command = text;
+  command.trim();
+  if (command == "RESET") {
+    logLine("收到管理员 RESET 命令");
+    resetModem();
+    delay(200);
+    ESP.restart();
+    return true;
+  }
+  if (command.startsWith("SMS:")) {
+    int separator = command.indexOf(':', 4);
+    if (separator <= 4) {
+      logLine("管理员 SMS 命令格式错误");
+      return true;
+    }
+    String phone = command.substring(4, separator);
+    String content = command.substring(separator + 1);
+    phone.trim(); content.trim();
+    bool ok = phone.length() && content.length() && sendSMS(phone.c_str(), content.c_str());
+    logLine("管理员远程发短信%s", ok ? "成功" : "失败");
+    if (ok && rtConfig.enableHttp && rtConfig.smsWebMode) sendSMSToServer(phone.c_str(), content.c_str(), NULL, 502);
+    return true;
+  }
+  return false;
+}
+
+void clearConcatMessage(ConcatSms& item) {
+  memset(&item, 0, sizeof(item));
+}
+
+void deliverConcatMessage(ConcatSms& item, bool timedOut) {
+  char fullText[SMS_TEXT_LEN] = {0};
+  for (uint8_t i = 0; i < item.total && i < MAX_CONCAT_PARTS; ++i) {
+    if (item.presentMask & (1U << i)) strlcat(fullText, item.parts[i], sizeof(fullText));
+    else if (timedOut) {
+      char missing[24];
+      snprintf(missing, sizeof(missing), "[缺失分段%u]", (unsigned int)(i + 1));
+      strlcat(fullText, missing, sizeof(fullText));
+    }
+  }
+  logLine("长短信%s，分段 %u/%u", timedOut ? "超时" : "合并完成", item.received, item.total);
+  processReceivedSMS(item.sender, fullText, item.timestamp);
+  clearConcatMessage(item);
+}
+
+void processReceivedSegment(const char* sender, const char* text, const char* timestamp,
+                            uint16_t reference, uint8_t part, uint8_t total) {
+  if (total <= 1 || part == 0) {
+    processReceivedSMS(sender, text, timestamp);
+    return;
+  }
+  if (total > MAX_CONCAT_PARTS || part > total) {
+    char marked[SMS_TEXT_LEN];
+    snprintf(marked, sizeof(marked), "[长短信分段 %u/%u] %s", part, total, text);
+    processReceivedSMS(sender, marked, timestamp);
+    return;
+  }
+
+  ConcatSms* slot = NULL;
+  ConcatSms* oldest = &concatMessages[0];
+  for (uint8_t i = 0; i < MAX_CONCAT_MESSAGES; ++i) {
+    ConcatSms &candidate = concatMessages[i];
+    if (candidate.used && candidate.reference == reference &&
+        normalizedPhone(candidate.sender) == normalizedPhone(sender)) {
+      slot = &candidate;
+      break;
+    }
+    if (!candidate.used && !slot) slot = &candidate;
+    if (candidate.startedAt < oldest->startedAt) oldest = &candidate;
+  }
+  if (!slot || (slot->used && (slot->reference != reference || normalizedPhone(slot->sender) != normalizedPhone(sender)))) {
+    logLine("长短信缓存已满，先转发最早的不完整消息");
+    deliverConcatMessage(*oldest, true);
+    slot = oldest;
+  }
+  if (!slot->used) {
+    clearConcatMessage(*slot);
+    slot->used = true;
+    slot->reference = reference;
+    slot->total = total;
+    slot->startedAt = millis();
+    strlcpy(slot->sender, sender, sizeof(slot->sender));
+    strlcpy(slot->timestamp, timestamp ? timestamp : "", sizeof(slot->timestamp));
+  }
+  uint8_t index = part - 1;
+  if (!(slot->presentMask & (1U << index))) {
+    strlcpy(slot->parts[index], text, sizeof(slot->parts[index]));
+    slot->presentMask |= (1U << index);
+    ++slot->received;
+  }
+  if (slot->received >= slot->total) deliverConcatMessage(*slot, false);
+}
+
+void checkConcatTimeouts() {
+  unsigned long now = millis();
+  for (uint8_t i = 0; i < MAX_CONCAT_MESSAGES; ++i) {
+    if (concatMessages[i].used && now - concatMessages[i].startedAt >= CONCAT_TIMEOUT_MS)
+      deliverConcatMessage(concatMessages[i], true);
+  }
+}
+
 // 处理接收到的短信内容（分发到各渠道）
 void processReceivedSMS(const char* sender, const char* text, const char* timestamp) {
+  logLine("收到短信 [%s]: %.160s", sender ? sender : "", text ? text : "");
+  if (isBlacklisted(sender)) {
+    logLine("短信已被号码黑名单过滤: %s", sender);
+    return;
+  }
+  if (handleAdminSms(sender, text)) return;
+
   // 各渠道发送状态
   bool wecomOk = true, emailOk = true, httpOk = true;
+  uint16_t pushMask = 0;
   if (rtConfig.enableWecom) {
     wecomOk = sendSMSToWeComBot(sender, text, timestamp);
   }
@@ -674,13 +1105,19 @@ void processReceivedSMS(const char* sender, const char* text, const char* timest
   if (rtConfig.enableEmail) {
     emailOk = sendSMSToEmail(sender, text, timestamp);
   }
+  for (uint8_t i = 0; i < MAX_PUSH_CHANNELS; ++i) {
+    if (!isPushChannelValid(rtConfig.pushChannels[i]) || sendPushChannel(rtConfig.pushChannels[i], sender, text, timestamp))
+      pushMask |= (1U << i);
+  }
   // 只有存在失败的渠道才入队，并记录各渠道状态
   bool needRetry = (rtConfig.enableWecom && !wecomOk) || 
                    (rtConfig.enableEmail && !emailOk) || 
                    (rtConfig.enableHttp && !httpOk);
+  for (uint8_t i = 0; i < MAX_PUSH_CHANNELS; ++i)
+    if (isPushChannelValid(rtConfig.pushChannels[i]) && !(pushMask & (1U << i))) needRetry = true;
   if (needRetry) {
     Serial.println("部分或全部发送失败，入队以便重试");
-    enqueueSMSWithStatus(sender, text, timestamp, wecomOk, emailOk, httpOk);
+    enqueueSMSWithStatus(sender, text, timestamp, wecomOk, emailOk, httpOk, pushMask);
   }
 }
 
@@ -693,7 +1130,7 @@ void checkSerial1URC() {
   if (line.length() == 0) return;
 
   // 打印到调试串口
-  Serial.println("Debug> " + line);
+  logLine("MODEM: %.220s", line.c_str());
 
   if (state == IDLE) {
     // 检测到短信上报URC头
@@ -723,8 +1160,11 @@ void checkSerial1URC() {
         Serial.println("内容: " + String(pdu.getText()));
         Serial.println("===============");
 
-        // 根据配置开关执行各推送方式：先尝试立即发送，失败则入队重试
-        processReceivedSMS(pdu.getSender(), pdu.getText(), pdu.getTimeStamp());
+        int* concat = pdu.getConcatInfo();
+        uint16_t reference = concat ? concat[0] : 0;
+        uint8_t part = concat ? concat[1] : 0;
+        uint8_t total = concat ? concat[2] : 1;
+        processReceivedSegment(pdu.getSender(), pdu.getText(), pdu.getTimeStamp(), reference, part, total);
       }
       
       // 返回IDLE状态
@@ -761,6 +1201,29 @@ bool sendATandWaitOK(const char* cmd, unsigned long timeout) {
   return false;
 }
 
+String sendATCommand(const char* command, unsigned long timeout) {
+  while (Serial1.available()) Serial1.read();
+  Serial1.println(command);
+  String response;
+  response.reserve(512);
+  unsigned long started = millis();
+  unsigned long lastByte = started;
+  bool terminal = false;
+  while (millis() - started < timeout) {
+    while (Serial1.available()) {
+      char c = Serial1.read();
+      if (response.length() < 1024) response += c;
+      lastByte = millis();
+      if (response.indexOf("\r\nOK\r\n") >= 0 || response.indexOf("\r\nERROR\r\n") >= 0) terminal = true;
+    }
+    if (terminal && millis() - lastByte > 150) break;
+    esp_task_wdt_reset();
+    delay(1);
+  }
+  logLine("AT命令: %s", command);
+  return response;
+}
+
 bool waitCGATT1() {
   Serial1.println("AT+CGATT?");
   unsigned long start = millis();
@@ -781,15 +1244,21 @@ void setup() {
   bootTime = millis();
   
   // 初始化看门狗（防止死锁）- 兼容 ESP-IDF 5.x
+#if ESP_IDF_VERSION_MAJOR >= 5
   esp_task_wdt_config_t wdt_config = {
     .timeout_ms = WDT_TIMEOUT_SEC * 1000,
-    .idle_core_mask = (1 << portNUM_PROCESSORS) - 1,  // 监控所有核心
+    .idle_core_mask = (1 << portNUM_PROCESSORS) - 1,
     .trigger_panic = true
   };
   esp_task_wdt_init(&wdt_config);
+#else
+  esp_task_wdt_init(WDT_TIMEOUT_SEC, true);
+#endif
   esp_task_wdt_add(NULL);
   
   pinMode(LED_BUILTIN, OUTPUT);
+  pinMode(MODEM_EN_PIN, OUTPUT);
+  digitalWrite(MODEM_EN_PIN, HIGH);
   digitalWrite(LED_BUILTIN, HIGH);
   Serial.begin(115200);
   Serial1.begin(115200, SERIAL_8N1, RXD, TXD);
@@ -800,7 +1269,16 @@ void setup() {
   
   WiFiMulti.addAP(WIFI_SSID, WIFI_PASS);
   Serial.println("连接wifi");
-  while (WiFiMulti.run() != WL_CONNECTED) blink_short();
+  unsigned long wifiStarted = millis();
+  while (WiFiMulti.run() != WL_CONNECTED && millis() - wifiStarted < 30000UL) {
+    esp_task_wdt_reset();
+    blink_short(250);
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi 连接超时，重启后重试");
+    delay(100);
+    ESP.restart();
+  }
   Serial.println("wifi已连接");
   Serial.print("IP 地址: ");
   Serial.println(WiFi.localIP());
@@ -812,21 +1290,33 @@ void setup() {
   
   ssl_client.setInsecure();
   ssl_client.setTimeout(30000); // 设置 SSL 超时 30s，防止网络卡死触发看门狗
-  while (!sendATandWaitOK("AT", 1000)) {
+  unsigned long modemStarted = millis();
+  while (!sendATandWaitOK("AT", 1000) && millis() - modemStarted < 30000UL) {
     Serial.println("AT未响应，重试...");
+    webServer.handleClient();
+    esp_task_wdt_reset();
     blink_short();
   }
-  Serial.println("模组AT响应正常");
-  while (!sendATandWaitOK("AT+CNMI=2,2,0,0,0", 1000)) {
+  bool modemReady = millis() - modemStarted < 30000UL;
+  Serial.println(modemReady ? "模组AT响应正常" : "模组无响应，Web 管理仍可使用");
+  if (!modemReady) return;
+  sendATandWaitOK("AT+CMGF=0", 1000);
+  modemStarted = millis();
+  while (!sendATandWaitOK("AT+CNMI=2,2,0,0,0", 1000) && millis() - modemStarted < 30000UL) {
     Serial.println("设置CNMI失败，重试...");
+    webServer.handleClient();
+    esp_task_wdt_reset();
     blink_short();
   }
   Serial.println("CNMI参数设置完成");
-  while (!waitCGATT1()) {
+  modemStarted = millis();
+  while (!waitCGATT1() && millis() - modemStarted < 90000UL) {
     Serial.println("等待CGATT附着...");
+    webServer.handleClient();
+    esp_task_wdt_reset();
     blink_short();
   }
-  Serial.println("CGATT已附着");
+  Serial.println(millis() - modemStarted < 90000UL ? "CGATT已附着" : "网络注册超时，后台继续运行");
   digitalWrite(LED_BUILTIN, LOW);
 }
 
@@ -865,6 +1355,7 @@ void loop() {
   }
   // 处理队列中的待重试短信
   processSMSQueue();
+  checkConcatTimeouts();
   // 检查URC和解析
   checkSerial1URC();
   
@@ -891,7 +1382,7 @@ void enqueueSMS(const char* sender, const char* text, const char* timestamp) {
 }
 
 // 带渠道状态的入队函数
-void enqueueSMSWithStatus(const char* sender, const char* text, const char* timestamp, bool wecomOk, bool emailOk, bool httpOk) {
+void enqueueSMSWithStatus(const char* sender, const char* text, const char* timestamp, bool wecomOk, bool emailOk, bool httpOk, uint16_t pushMask) {
   int insertIdx = (sms_q_head + sms_q_count) % SMS_QUEUE_SIZE;
   if (sms_q_count == SMS_QUEUE_SIZE) {
     // 队列已满，丢弃最老一条以腾出空间
@@ -915,6 +1406,7 @@ void enqueueSMSWithStatus(const char* sender, const char* text, const char* time
   smsQueue[insertIdx].wecomSent = wecomOk;
   smsQueue[insertIdx].emailSent = emailOk;
   smsQueue[insertIdx].httpSent = httpOk;
+  smsQueue[insertIdx].pushSentMask = pushMask;
   sms_q_count++;
   Serial.printf("已入队，队列长度=%d\n", sms_q_count);
 }
@@ -952,6 +1444,15 @@ bool trySendChannels(SMSItem &item) {
       Serial.println("邮件发送成功");
     } else {
       allOk = false;
+    }
+  }
+  for (uint8_t i = 0; i < MAX_PUSH_CHANNELS; ++i) {
+    if (!isPushChannelValid(rtConfig.pushChannels[i])) continue;
+    if (!(item.pushSentMask & (1U << i))) {
+      if (sendPushChannel(rtConfig.pushChannels[i], item.sender, item.text, item.timestamp))
+        item.pushSentMask |= (1U << i);
+      else
+        allOk = false;
     }
   }
   return allOk;
@@ -1117,7 +1618,7 @@ String getHeader(String title) {
   h += "label{font-weight:600;display:block;margin-bottom:5px;color:#555}.check-group{margin-bottom:15px;display:flex;align-items:center;background:#f8f9fa;padding:10px;border-radius:4px}.check-group input{width:auto;margin:0 10px 0 0}";
   h += ".status-ok{color:#28a745;font-weight:bold}.status-err{color:#dc3545;font-weight:bold}";
   h += "</style></head><body>";
-  h += "<div class='nav'><a href='/'>🏠 仪表盘</a><a href='/config'>⚙️ 配置</a><a href='/queue'>📨 队列</a></div>";
+  h += "<div class='nav'><a href='/'>🏠 仪表盘</a><a href='/config'>⚙️ 配置</a><a href='/queue'>📨 队列</a><a href='/modem'>📶 模组</a><a href='/logs'>📜 日志</a></div>";
   return h;
 }
 
@@ -1184,6 +1685,8 @@ void handleConfigGet() {
   html += "<div class='check-group'><input type=\"checkbox\" name=\"enwecom\" " + String(rtConfig.enableWecom?"checked":"") + "><label class='checkbox-label'>启用企业微信推送</label></div>";
   
   html += "<label>本机号码 (用于标识)</label><input name=\"simnum\" value=\"" + htmlEncode(String(rtConfig.simNumber)) + "\">";
+  html += "<label>管理员号码（允许 SMS:号码:内容 和 RESET 命令）</label><input name=\"adminphone\" value=\"" + htmlEncode(String(rtConfig.adminPhone)) + "\">";
+  html += "<label>号码黑名单（每行或逗号分隔）</label><textarea name=\"blacklist\" rows=4>" + htmlEncode(String(rtConfig.numberBlacklist)) + "</textarea>";
   
   html += "<hr style='margin:20px 0;border:0;border-top:1px solid #eee'>";
   html += "<label>SMTP 服务器</label><input name=\"smtpserver\" value=\"" + htmlEncode(String(rtConfig.smtpServer)) + "\">";
@@ -1200,6 +1703,21 @@ void handleConfigGet() {
   html += "<label>sms_web API Key</label><input name=\"httpkey\" type=\"password\" value=\"" + htmlEncode(String(rtConfig.httpApiKey)) + "\">";
   html += "<label>设备 ID</label><input name=\"deviceid\" value=\"" + htmlEncode(String(rtConfig.deviceId)) + "\">";
   html += "<label>SIM 卡槽 (1/2)</label><input name=\"simslot\" type=\"number\" min=\"1\" max=\"2\" value=\"" + String(rtConfig.simSlot) + "\">";
+
+  html += "<hr style='margin:20px 0;border:0;border-top:1px solid #eee'><h3>扩展推送通道</h3>";
+  html += "<p>类型：1 POST JSON，2 Bark，3 GET，4 钉钉，5 PushPlus，6 Server酱，7 自定义，8 飞书，9 Gotify，10 Telegram。</p>";
+  for (uint8_t i = 0; i < MAX_PUSH_CHANNELS; ++i) {
+    PushChannelConfig &ch = rtConfig.pushChannels[i];
+    String prefix = "p" + String(i);
+    html += "<div style='border:1px solid #ddd;padding:12px;margin:10px 0'><strong>通道 " + String(i + 1) + "</strong>";
+    html += "<div class='check-group'><input type='checkbox' name='" + prefix + "e' " + String(ch.enabled ? "checked" : "") + "><label>启用</label></div>";
+    html += "<label>类型</label><input type='number' min='0' max='10' name='" + prefix + "t' value='" + String(ch.type) + "'>";
+    html += "<label>名称</label><input name='" + prefix + "n' value='" + htmlEncode(ch.name) + "'>";
+    html += "<label>URL / Webhook</label><input name='" + prefix + "u' value='" + htmlEncode(ch.url) + "'>";
+    html += "<label>Key 1（Secret/Token/Chat ID）</label><input name='" + prefix + "a' value='" + htmlEncode(ch.key1) + "'>";
+    html += "<label>Key 2（Channel/Bot Token）</label><input name='" + prefix + "b' value='" + htmlEncode(ch.key2) + "'>";
+    html += "<label>自定义 JSON 模板</label><textarea name='" + prefix + "c' rows='3'>" + htmlEncode(ch.customBody) + "</textarea></div>";
+  }
 
   html += "<hr style='margin:20px 0;border:0;border-top:1px solid #eee'>";
   html += "<label>Web 管理员用户名</label><input name=\"webuser\" value=\"" + htmlEncode(String(rtConfig.webUser)) + "\">";
@@ -1235,6 +1753,8 @@ void handleConfigPost() {
   bool smsweb = webServer.hasArg("smsweb");
   String webuser = webServer.arg("webuser");
   String webpass = webServer.arg("webpass");
+  String adminphone = webServer.arg("adminphone");
+  String blacklist = webServer.arg("blacklist");
 
   strlcpy(rtConfig.wecomUrl, wecom.c_str(), sizeof(rtConfig.wecomUrl));
   strlcpy(rtConfig.simNumber, simnum.c_str(), sizeof(rtConfig.simNumber));
@@ -1253,6 +1773,19 @@ void handleConfigPost() {
   rtConfig.smsWebMode = smsweb;
   strlcpy(rtConfig.webUser, webuser.c_str(), sizeof(rtConfig.webUser));
   strlcpy(rtConfig.webPass, webpass.c_str(), sizeof(rtConfig.webPass));
+  strlcpy(rtConfig.adminPhone, adminphone.c_str(), sizeof(rtConfig.adminPhone));
+  strlcpy(rtConfig.numberBlacklist, blacklist.c_str(), sizeof(rtConfig.numberBlacklist));
+  for (uint8_t i = 0; i < MAX_PUSH_CHANNELS; ++i) {
+    PushChannelConfig &ch = rtConfig.pushChannels[i];
+    String prefix = "p" + String(i);
+    ch.enabled = webServer.hasArg(prefix + "e");
+    ch.type = constrain(webServer.arg(prefix + "t").toInt(), 0, (int)PUSH_TELEGRAM);
+    strlcpy(ch.name, webServer.arg(prefix + "n").c_str(), sizeof(ch.name));
+    strlcpy(ch.url, webServer.arg(prefix + "u").c_str(), sizeof(ch.url));
+    strlcpy(ch.key1, webServer.arg(prefix + "a").c_str(), sizeof(ch.key1));
+    strlcpy(ch.key2, webServer.arg(prefix + "b").c_str(), sizeof(ch.key2));
+    strlcpy(ch.customBody, webServer.arg(prefix + "c").c_str(), sizeof(ch.customBody));
+  }
 
   bool saved = saveConfig();
   if (!saved) loadConfig(); // 写入失败时回到 NVS 中实际可读的状态
@@ -1301,6 +1834,12 @@ void handleQueue() {
       if(it.wecomSent) st += "<span class='status-ok'>WeCom✓</span> "; else if(rtConfig.enableWecom) st += "<span class='status-err'>WeCom✗</span> ";
       if(it.emailSent) st += "<span class='status-ok'>Email✓</span> "; else if(rtConfig.enableEmail) st += "<span class='status-err'>Email✗</span> ";
       if(it.httpSent) st += "<span class='status-ok'>HTTP✓</span> "; else if(rtConfig.enableHttp) st += "<span class='status-err'>HTTP✗</span> ";
+      for (uint8_t channel = 0; channel < MAX_PUSH_CHANNELS; ++channel) {
+        if (!isPushChannelValid(rtConfig.pushChannels[channel])) continue;
+        bool sent = it.pushSentMask & (1U << channel);
+        st += sent ? "<span class='status-ok'>P" + String(channel + 1) + "✓</span> "
+                   : "<span class='status-err'>P" + String(channel + 1) + "✗</span> ";
+      }
       html += "<td>" + st + "</td>";
       html += "</tr>";
     }
@@ -1387,6 +1926,92 @@ void handleCtrl() {
   webServer.send(400, "application/json", "{\"code\":-1,\"message\":\"unsupported command\"}");
 }
 
+void handleLogs() {
+  if (!checkAuth()) { requestAuth(); return; }
+  String html = getHeader("串口日志");
+  html += "<div class='card'><h2>运行日志</h2><p>固定 " + String(WEB_LOG_SIZE) + " 字节环形缓冲，不会持续占用内存。</p>";
+  html += "<pre style='white-space:pre-wrap;background:#111;color:#ddd;padding:12px;max-height:65vh;overflow:auto'>";
+  html += htmlEncode(getWebLog());
+  html += "</pre><p><a href='/logs'>刷新</a></p></div>" + getFooter();
+  webServer.send(200, "text/html", html);
+}
+
+void handleModemPage() {
+  if (!checkAuth()) { requestAuth(); return; }
+  String html = getHeader("模组管理");
+  html += "<div class='card'><h2>模组操作</h2>";
+  const char* actions[][2] = {{"info","模组信息"},{"signal","查询信号"},{"operator","查询运营商"},
+    {"imei","查询 IMEI"},{"flight-on","开启飞行模式"},{"flight-off","关闭飞行模式"},
+    {"ping","Ping 保号"},{"soft-reset","软重启模组"},{"hard-reset","硬重启模组"},{"wifi","重连 WiFi"}};
+  for (uint8_t i = 0; i < sizeof(actions) / sizeof(actions[0]); ++i)
+    html += "<form method='POST' action='/modem/action' style='margin:8px 0'><input type='hidden' name='action' value='" + String(actions[i][0]) + "'><input type='submit' value='" + actions[i][1] + "'></form>";
+  html += "</div><div class='card'><h2>AT 控制台</h2><form method='POST' action='/at'><input name='command' maxlength='80' value='AT'><input type='submit' value='发送 AT 指令'></form></div>";
+  html += getFooter();
+  webServer.send(200, "text/html", html);
+}
+
+void sendOperationResult(const String& title, const String& result) {
+  String html = getHeader(title);
+  html += "<div class='card'><h2>" + htmlEncode(title) + "</h2><pre style='white-space:pre-wrap'>" + htmlEncode(result) + "</pre><p><a href='/modem'>返回模组管理</a></p></div>" + getFooter();
+  webServer.send(200, "text/html", html);
+}
+
+void handleAtConsole() {
+  if (!checkAuth()) { requestAuth(); return; }
+  String command = webServer.arg("command");
+  command.trim();
+  if (!command.startsWith("AT") || command.length() > 80 || command.indexOf('\r') >= 0 || command.indexOf('\n') >= 0) {
+    webServer.send(400, "text/plain; charset=utf-8", "AT 指令不合法");
+    return;
+  }
+  sendOperationResult(command, sendATCommand(command.c_str(), 5000));
+}
+
+String performPing() {
+  String activate = sendATCommand("AT+CGACT=1,1", 10000);
+  while (Serial1.available()) Serial1.read();
+  Serial1.println("AT+MPING=\"8.8.8.8\",1,32,10000");
+  unsigned long started = millis();
+  String result = "PDP 激活响应:\n" + activate + "\nPing 响应:\n";
+  while (millis() - started < 12000) {
+    while (Serial1.available()) {
+      char c = Serial1.read();
+      if (result.length() < 1024) result += c;
+    }
+    if (result.indexOf("+MPING:") >= 0 || result.indexOf("ERROR") >= 0) break;
+    esp_task_wdt_reset();
+    delay(1);
+  }
+  sendATCommand("AT+CGACT=0,1", 5000);
+  logLine("Ping 保号操作完成");
+  return result;
+}
+
+void handleModemAction() {
+  if (!checkAuth()) { requestAuth(); return; }
+  String action = webServer.arg("action");
+  String result;
+  if (action == "info") result = sendATCommand("ATI");
+  else if (action == "signal") result = sendATCommand("AT+CSQ");
+  else if (action == "operator") result = sendATCommand("AT+COPS?");
+  else if (action == "imei") result = sendATCommand("AT+GSN");
+  else if (action == "flight-on") result = sendATCommand("AT+CFUN=4", 10000);
+  else if (action == "flight-off") result = sendATCommand("AT+CFUN=1", 10000);
+  else if (action == "ping") result = performPing();
+  else if (action == "soft-reset") result = sendATCommand("AT+CFUN=1,1", 10000);
+  else if (action == "hard-reset") result = resetModem() ? "OK" : "模组无响应";
+  else if (action == "wifi") {
+    WiFi.disconnect();
+    lastWifiAttempt = millis() - wifiReconnectInterval;
+    ensureWiFiConnected();
+    result = WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : "后台重连中";
+  } else {
+    webServer.send(400, "text/plain; charset=utf-8", "未知操作");
+    return;
+  }
+  sendOperationResult("操作结果", result);
+}
+
 // 初始化 Web 路由
 void setupWebServer() {
   webServer.on("/", HTTP_GET, handleRoot);
@@ -1397,6 +2022,10 @@ void setupWebServer() {
   webServer.on("/config/reset", HTTP_POST, handleConfigReset);
   webServer.on("/queue", HTTP_GET, handleQueue);
   webServer.on("/ctrl", HTTP_GET, handleCtrl);
+  webServer.on("/logs", HTTP_GET, handleLogs);
+  webServer.on("/modem", HTTP_GET, handleModemPage);
+  webServer.on("/modem/action", HTTP_POST, handleModemAction);
+  webServer.on("/at", HTTP_POST, handleAtConsole);
   webServer.begin();
   Serial.println("Web 服务器已启动");
 }

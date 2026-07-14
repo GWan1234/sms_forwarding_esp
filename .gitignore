@@ -12,6 +12,7 @@ sms_log.json
 
 # 编译输出
 build/
+.pio/
 *.o
 *.bin
 *.elf
@@ -23,3 +24,5 @@ build/
 .idea/
 *.swp
 *.swo
+
+ML307A_ref/

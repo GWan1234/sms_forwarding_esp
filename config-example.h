@@ -37,6 +37,15 @@ const char* LOCAL_SIM_NUMBER = "xxx";
 #define DEVICE_ID "esp32-sms-01"           // sms_web 中唯一的设备 ID
 #define SIM_SLOT 1                          // 单卡模组映射到 sms_web 卡槽 1 或 2
 
+// ==================== 资源与硬件调优（可选） ====================
+// 取消注释后可覆盖固件默认值。ESP32-C3 建议先使用默认配置。
+// #define MODEM_EN_PIN 5          // 模组 EN 引脚；不使用硬重启时请勿在 Web 点击硬重启
+// #define SMS_QUEUE_SIZE 8        // 每条队列项约 1.35KB
+// #define MAX_PUSH_CHANNELS 3     // 扩展推送通道槽位数
+// #define MAX_CONCAT_MESSAGES 2   // 同时缓存的长短信组数
+// #define MAX_CONCAT_PARTS 8      // 每组最大分段数
+// #define WEB_LOG_SIZE 3072       // 网页环形日志字节数
+
 // ==================== 推送方式开关 ====================
 // 设置为 1 启用，设置为 0 禁用，可同时启用多种推送方式
 #define ENABLE_WECOM_BOT    1   // 企业微信机器人推送
