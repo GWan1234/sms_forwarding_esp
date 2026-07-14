@@ -29,8 +29,13 @@ const char* LOCAL_SIM_NUMBER = "xxx";
 #define SMTP_PASS "xxx"//登录密码，注意qq邮箱需要去生成专用授权码
 #define SMTP_SEND_TO "xxxx@qq.com"//收邮件的邮箱号
 
-// ==================== HTTP 服务器配置 ====================
-#define HTTP_SERVER_URL "http://your-server.com/api/sms"  // 自定义服务器 URL
+// ==================== HTTP / sms_web 配置 ====================
+// sms_web 必须指向 /push，不要填管理端 /api/sms。
+#define HTTP_SERVER_URL "http://your-server:3000/push"
+#define HTTP_SMS_WEB_MODE 1                 // 1=sms_web 协议，0=原通用 JSON 协议
+#define HTTP_API_KEY "change-this-api-key" // 与 sms_web 的 API_KEY 一致
+#define DEVICE_ID "esp32-sms-01"           // sms_web 中唯一的设备 ID
+#define SIM_SLOT 1                          // 单卡模组映射到 sms_web 卡槽 1 或 2
 
 // ==================== 推送方式开关 ====================
 // 设置为 1 启用，设置为 0 禁用，可同时启用多种推送方式

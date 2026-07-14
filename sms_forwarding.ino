@@ -11,6 +11,7 @@
 #include <WebServer.h>
 #include <Preferences.h>
 #include <base64.h>
+#include <MD5Builder.h>
 
 // 看门狗超时（秒）
 #define WDT_TIMEOUT_SEC 60
@@ -23,6 +24,20 @@
 
 // 引入配置文件（敏感信息在此文件中定义）
 #include "config.h"
+
+// 旧 config.h 不增加新宏也可编译，并保持原通用 HTTP 行为。
+#ifndef HTTP_SMS_WEB_MODE
+#define HTTP_SMS_WEB_MODE 0
+#endif
+#ifndef HTTP_API_KEY
+#define HTTP_API_KEY ""
+#endif
+#ifndef DEVICE_ID
+#define DEVICE_ID "esp32-sms"
+#endif
+#ifndef SIM_SLOT
+#define SIM_SLOT 1
+#endif
 
 // Web 服务器端口
 #define WEB_SERVER_PORT 80
@@ -51,9 +66,13 @@ struct RuntimeConfig {
   char smtpPass[64];
   char smtpTo[64];
   char httpServerUrl[128];
+  char httpApiKey[64];
+  char deviceId[32];
+  uint8_t simSlot;
   bool enableWecom;
   bool enableEmail;
   bool enableHttp;
+  bool smsWebMode;
   char webUser[32];
   char webPass[32];
 } rtConfig;
@@ -143,6 +162,33 @@ String escapeJson(const char* str) {
   return result;
 }
 
+// pdulib 返回 YYMMDDHHmmssTZ，TZ 为 15 分钟单位。sms_web 使用 Unix 秒级时间戳。
+time_t pduTimestampToUnix(const char* value) {
+  if (!value || strlen(value) < 12) return 0;
+  for (uint8_t i = 0; i < 12; ++i) if (!isdigit(value[i])) return 0;
+
+  struct tm parsed = {0};
+  parsed.tm_year = 100 + (value[0] - '0') * 10 + value[1] - '0';
+  parsed.tm_mon  = (value[2] - '0') * 10 + value[3] - '0' - 1;
+  parsed.tm_mday = (value[4] - '0') * 10 + value[5] - '0';
+  parsed.tm_hour = (value[6] - '0') * 10 + value[7] - '0';
+  parsed.tm_min  = (value[8] - '0') * 10 + value[9] - '0';
+  parsed.tm_sec  = (value[10] - '0') * 10 + value[11] - '0';
+  parsed.tm_isdst = 0;
+
+  int timezoneSeconds = 0;
+  const char* timezone = value + 12;
+  int sign = 1;
+  if (*timezone == '+' || *timezone == '-') {
+    if (*timezone++ == '-') sign = -1;
+  }
+  if (isdigit(timezone[0]) && isdigit(timezone[1])) {
+    timezoneSeconds = sign * ((timezone[0] - '0') * 10 + timezone[1] - '0') * 15 * 60;
+  }
+  time_t localEpoch = mktime(&parsed);
+  return localEpoch > 0 ? localEpoch - timezoneSeconds : 0;
+}
+
 
 WiFiMulti WiFiMulti;
 PDU pdu = PDU(4096);
@@ -155,7 +201,9 @@ char serialBuf[SERIAL_BUFFER_SIZE];
 int serialBufLen = 0;
 
 // 队列与重试配置
-#define SMS_QUEUE_SIZE 20
+#ifndef SMS_QUEUE_SIZE
+#define SMS_QUEUE_SIZE 8       // 默认约占 11KB；原值 20 会占用约 27KB 常驻 RAM
+#endif
 #define SMS_MAX_RETRIES 5
 #define SMS_RETRY_INTERVAL_MS 60000UL // 60s
 
@@ -185,12 +233,15 @@ bool trySendChannels(SMSItem &item);  // 改为非const，需要更新状态
 void processSMSQueue();
 void ensureWiFiConnected();
 void loadConfig();
-void saveConfig();
+bool saveConfig();
+bool resetConfig();
 void setupWebServer();
 bool checkAuth();
 bool sendSMS(const char* phoneNumber, const char* message);
 String htmlEncode(const String& str);
 void processReceivedSMS(const char* sender, const char* text, const char* timestamp);
+void handleCtrl();
+bool sendSmsWebDeviceEvent(uint16_t type);
 
 SMSItem smsQueue[SMS_QUEUE_SIZE];
 int sms_q_head = 0; // index of oldest
@@ -202,10 +253,37 @@ unsigned long wifiReconnectInterval = 5000; // 初始重连间隔 ms
 
 // 系统启动时间（用于定时重启）
 unsigned long bootTime = 0;
+unsigned long lastSmsWebHeartbeat = 0;
+#define SMS_WEB_HEARTBEAT_MS 120000UL
 
 // ==================== 持久化配置函数 ====================
+void loadCompileTimeDefaults() {
+  strlcpy(rtConfig.wecomUrl, WECHAT_WEBHOOK_URL, sizeof(rtConfig.wecomUrl));
+  strlcpy(rtConfig.simNumber, LOCAL_SIM_NUMBER, sizeof(rtConfig.simNumber));
+  strlcpy(rtConfig.smtpServer, SMTP_SERVER, sizeof(rtConfig.smtpServer));
+  rtConfig.smtpPort = SMTP_SERVER_PORT;
+  strlcpy(rtConfig.smtpUser, SMTP_USER, sizeof(rtConfig.smtpUser));
+  strlcpy(rtConfig.smtpPass, SMTP_PASS, sizeof(rtConfig.smtpPass));
+  strlcpy(rtConfig.smtpTo, SMTP_SEND_TO, sizeof(rtConfig.smtpTo));
+  strlcpy(rtConfig.httpServerUrl, HTTP_SERVER_URL, sizeof(rtConfig.httpServerUrl));
+  strlcpy(rtConfig.httpApiKey, HTTP_API_KEY, sizeof(rtConfig.httpApiKey));
+  strlcpy(rtConfig.deviceId, DEVICE_ID, sizeof(rtConfig.deviceId));
+  rtConfig.simSlot = constrain(SIM_SLOT, 1, 2);
+  rtConfig.enableWecom = ENABLE_WECOM_BOT;
+  rtConfig.enableEmail = ENABLE_EMAIL;
+  rtConfig.enableHttp = ENABLE_HTTP_SERVER;
+  rtConfig.smsWebMode = HTTP_SMS_WEB_MODE;
+  strlcpy(rtConfig.webUser, WEB_ADMIN_USER, sizeof(rtConfig.webUser));
+  strlcpy(rtConfig.webPass, WEB_ADMIN_PASS, sizeof(rtConfig.webPass));
+}
+
 void loadConfig() {
-  preferences.begin("sms_config", true);  // 只读模式
+  // config.h 是默认值；只有 NVS 键存在时才覆盖。
+  loadCompileTimeDefaults();
+  if (!preferences.begin("sms_config", true)) {
+    Serial.println("❌ 无法以只读模式打开 NVS，使用 config.h 默认值");
+    return;
+  }
   
   // 加载配置，如果不存在则使用默认值
   strlcpy(rtConfig.wecomUrl, preferences.getString("wecomUrl", WECHAT_WEBHOOK_URL).c_str(), sizeof(rtConfig.wecomUrl));
@@ -216,9 +294,13 @@ void loadConfig() {
   strlcpy(rtConfig.smtpPass, preferences.getString("smtpPass", SMTP_PASS).c_str(), sizeof(rtConfig.smtpPass));
   strlcpy(rtConfig.smtpTo, preferences.getString("smtpTo", SMTP_SEND_TO).c_str(), sizeof(rtConfig.smtpTo));
   strlcpy(rtConfig.httpServerUrl, preferences.getString("httpUrl", HTTP_SERVER_URL).c_str(), sizeof(rtConfig.httpServerUrl));
+  strlcpy(rtConfig.httpApiKey, preferences.getString("httpKey", HTTP_API_KEY).c_str(), sizeof(rtConfig.httpApiKey));
+  strlcpy(rtConfig.deviceId, preferences.getString("deviceId", DEVICE_ID).c_str(), sizeof(rtConfig.deviceId));
+  rtConfig.simSlot = constrain(preferences.getUChar("simSlot", SIM_SLOT), 1, 2);
   rtConfig.enableWecom = preferences.getBool("enWecom", ENABLE_WECOM_BOT);
   rtConfig.enableEmail = preferences.getBool("enEmail", ENABLE_EMAIL);
   rtConfig.enableHttp = preferences.getBool("enHttp", ENABLE_HTTP_SERVER);
+  rtConfig.smsWebMode = preferences.getBool("smsWeb", HTTP_SMS_WEB_MODE);
   strlcpy(rtConfig.webUser, preferences.getString("webUser", WEB_ADMIN_USER).c_str(), sizeof(rtConfig.webUser));
   strlcpy(rtConfig.webPass, preferences.getString("webPass", WEB_ADMIN_PASS).c_str(), sizeof(rtConfig.webPass));
   
@@ -226,25 +308,75 @@ void loadConfig() {
   Serial.println("配置已从 NVS 加载");
 }
 
-void saveConfig() {
-  preferences.begin("sms_config", false);  // 读写模式
-  
-  preferences.putString("wecomUrl", rtConfig.wecomUrl);
-  preferences.putString("simNumber", rtConfig.simNumber);
-  preferences.putString("smtpServer", rtConfig.smtpServer);
-  preferences.putUShort("smtpPort", rtConfig.smtpPort);
-  preferences.putString("smtpUser", rtConfig.smtpUser);
-  preferences.putString("smtpPass", rtConfig.smtpPass);
-  preferences.putString("smtpTo", rtConfig.smtpTo);
-  preferences.putString("httpUrl", rtConfig.httpServerUrl);
-  preferences.putBool("enWecom", rtConfig.enableWecom);
-  preferences.putBool("enEmail", rtConfig.enableEmail);
-  preferences.putBool("enHttp", rtConfig.enableHttp);
-  preferences.putString("webUser", rtConfig.webUser);
-  preferences.putString("webPass", rtConfig.webPass);
-  
+bool verifyStoredConfig() {
+  if (!preferences.begin("sms_config", true)) return false;
+  bool ok =
+    preferences.getString("wecomUrl", "") == rtConfig.wecomUrl &&
+    preferences.getString("simNumber", "") == rtConfig.simNumber &&
+    preferences.getString("smtpServer", "") == rtConfig.smtpServer &&
+    preferences.getUShort("smtpPort", 0) == rtConfig.smtpPort &&
+    preferences.getString("smtpUser", "") == rtConfig.smtpUser &&
+    preferences.getString("smtpPass", "") == rtConfig.smtpPass &&
+    preferences.getString("smtpTo", "") == rtConfig.smtpTo &&
+    preferences.getString("httpUrl", "") == rtConfig.httpServerUrl &&
+    preferences.getString("httpKey", "") == rtConfig.httpApiKey &&
+    preferences.getString("deviceId", "") == rtConfig.deviceId &&
+    preferences.getUChar("simSlot", 0) == rtConfig.simSlot &&
+    preferences.getBool("enWecom", !rtConfig.enableWecom) == rtConfig.enableWecom &&
+    preferences.getBool("enEmail", !rtConfig.enableEmail) == rtConfig.enableEmail &&
+    preferences.getBool("enHttp", !rtConfig.enableHttp) == rtConfig.enableHttp &&
+    preferences.getBool("smsWeb", !rtConfig.smsWebMode) == rtConfig.smsWebMode &&
+    preferences.getString("webUser", "") == rtConfig.webUser &&
+    preferences.getString("webPass", "") == rtConfig.webPass;
   preferences.end();
-  Serial.println("配置已保存到 NVS");
+  return ok;
+}
+
+bool saveConfig() {
+  if (!preferences.begin("sms_config", false)) {
+    Serial.println("❌ 无法以读写模式打开 NVS");
+    return false;
+  }
+
+  bool ok = true;
+  ok = preferences.putString("wecomUrl", rtConfig.wecomUrl) > 0 && ok;
+  ok = preferences.putString("simNumber", rtConfig.simNumber) > 0 && ok;
+  ok = preferences.putString("smtpServer", rtConfig.smtpServer) > 0 && ok;
+  ok = preferences.putUShort("smtpPort", rtConfig.smtpPort) > 0 && ok;
+  ok = preferences.putString("smtpUser", rtConfig.smtpUser) > 0 && ok;
+  ok = preferences.putString("smtpPass", rtConfig.smtpPass) > 0 && ok;
+  ok = preferences.putString("smtpTo", rtConfig.smtpTo) > 0 && ok;
+  ok = preferences.putString("httpUrl", rtConfig.httpServerUrl) > 0 && ok;
+  ok = preferences.putString("httpKey", rtConfig.httpApiKey) > 0 && ok;
+  ok = preferences.putString("deviceId", rtConfig.deviceId) > 0 && ok;
+  ok = preferences.putUChar("simSlot", rtConfig.simSlot) > 0 && ok;
+  ok = preferences.putBool("enWecom", rtConfig.enableWecom) > 0 && ok;
+  ok = preferences.putBool("enEmail", rtConfig.enableEmail) > 0 && ok;
+  ok = preferences.putBool("enHttp", rtConfig.enableHttp) > 0 && ok;
+  ok = preferences.putBool("smsWeb", rtConfig.smsWebMode) > 0 && ok;
+  ok = preferences.putString("webUser", rtConfig.webUser) > 0 && ok;
+  ok = preferences.putString("webPass", rtConfig.webPass) > 0 && ok;
+  preferences.end();
+
+  if (ok) ok = verifyStoredConfig();
+  Serial.println(ok ? "✅ 配置已写入 NVS 并通过回读校验" : "❌ NVS 配置写入或回读校验失败");
+  return ok;
+}
+
+bool resetConfig() {
+  if (!preferences.begin("sms_config", false)) {
+    Serial.println("❌ 无法打开 NVS，恢复默认配置失败");
+    return false;
+  }
+  bool ok = preferences.clear();
+  preferences.end();
+  if (ok) {
+    loadCompileTimeDefaults();
+    Serial.println("✅ NVS 配置已清空，已恢复 config.h 默认值");
+  } else {
+    Serial.println("❌ NVS 配置清空失败");
+  }
+  return ok;
 }
 
 // HTML 编码函数（防止 XSS）
@@ -320,43 +452,71 @@ void requestAuth() {
 }
 
 
-// 发送短信数据到服务器，按需修改，返回是否成功
-bool sendSMSToServer(const char* sender, const char* message, const char* timestamp) {
+bool postHttpJson(String& jsonData) {
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("sendSMSToServer: WiFi 未连接");
+    Serial.println("HTTP 推送失败: WiFi 未连接");
     return false;
   }
-  if (!rtConfig.enableHttp) {
-    return true;  // 未启用视为成功
-  }
   HTTPClient http;
-  Serial.println("\n发送短信数据到服务器...");
   http.begin(rtConfig.httpServerUrl);
+  http.useHTTP10(true); // 关闭长连接，减少长时间占用的 socket/堆内存
   http.setTimeout(HTTP_TIMEOUT_MS);
   http.setConnectTimeout(HTTP_TIMEOUT_MS);
   http.addHeader("Content-Type", "application/json");
-  
-  // 构造JSON（使用转义函数防止特殊字符破坏JSON格式）
-  String jsonData = "{";
-  jsonData += "\"sender\":\"" + escapeJson(sender) + "\",";
-  jsonData += "\"message\":\"" + escapeJson(message) + "\",";
-  jsonData += "\"timestamp\":\"" + escapeJson(timestamp) + "\"";
-  jsonData += "}";
-  Serial.println("发送数据: " + jsonData);
+  if (rtConfig.httpApiKey[0]) http.addHeader("X-API-Key", rtConfig.httpApiKey);
+
   int httpCode = http.POST(jsonData);
-  bool ok = false;
-  if (httpCode > 0) {
-    Serial.printf("服务器响应码: %d\n", httpCode);
-    if (httpCode == HTTP_CODE_OK || httpCode == HTTP_CODE_CREATED) {
-      String response = http.getString();
-      Serial.println("服务器响应: " + response);
-      ok = true;
-    }
-  } else {
+  bool ok = httpCode >= 200 && httpCode < 300;
+  if (!ok && httpCode <= 0) {
     Serial.printf("HTTP请求失败: %s\n", http.errorToString(httpCode).c_str());
+  } else {
+    Serial.printf("HTTP 响应码: %d\n", httpCode);
   }
   http.end();
   return ok;
+}
+
+// 发送短信数据到服务器。sms_web 模式使用其开发板推送协议。
+bool sendSMSToServer(const char* sender, const char* message, const char* timestamp,
+                     uint16_t messageType = 501, const char* tid = NULL) {
+  if (!rtConfig.enableHttp) return true;
+
+  String jsonData;
+  jsonData.reserve(strlen(message) + strlen(sender) + 180);
+  if (rtConfig.smsWebMode) {
+    jsonData = "{\"devId\":\"";
+    jsonData += escapeJson(rtConfig.deviceId);
+    jsonData += "\",\"type\":" + String(messageType);
+    jsonData += ",\"slot\":" + String(rtConfig.simSlot);
+    jsonData += ",\"phNum\":\"" + escapeJson(sender);
+    jsonData += "\",\"smsBd\":\"" + escapeJson(message);
+    jsonData += "\",\"msIsdn\":\"" + escapeJson(rtConfig.simNumber) + "\"";
+    time_t smsTime = timestamp ? pduTimestampToUnix(timestamp) : time(NULL);
+    if (smsTime > 0) jsonData += ",\"smsTs\":" + String((unsigned long)smsTime);
+    if (tid && *tid) jsonData += ",\"tid\":\"" + escapeJson(tid) + "\"";
+    jsonData += "}";
+  } else {
+    jsonData = "{\"sender\":\"" + escapeJson(sender);
+    jsonData += "\",\"message\":\"" + escapeJson(message);
+    jsonData += "\",\"timestamp\":\"" + escapeJson(timestamp ? timestamp : "") + "\"}";
+  }
+  return postHttpJson(jsonData);
+}
+
+bool sendSmsWebDeviceEvent(uint16_t type) {
+  if (!rtConfig.enableHttp || !rtConfig.smsWebMode) return true;
+  String jsonData;
+  jsonData.reserve(180);
+  jsonData = "{\"devId\":\"" + escapeJson(rtConfig.deviceId);
+  jsonData += "\",\"type\":" + String(type);
+  if (type == 100) {
+    jsonData += ",\"ip\":\"" + WiFi.localIP().toString();
+    jsonData += "\",\"ssid\":\"" + escapeJson(WiFi.SSID().c_str());
+    jsonData += "\",\"dbm\":" + String(WiFi.RSSI());
+    jsonData += ",\"hwVer\":\"ESP32-sms_forwarding\"";
+  }
+  jsonData += "}";
+  return postHttpJson(jsonData);
 }
 
 // 通过企业微信机器人发送短信内容
@@ -647,6 +807,8 @@ void setup() {
   
   // 启动 Web 服务器
   setupWebServer();
+  sendSmsWebDeviceEvent(100); // 让 sms_web 建立设备记录并保存可控 IP
+  lastSmsWebHeartbeat = millis();
   
   ssl_client.setInsecure();
   ssl_client.setTimeout(30000); // 设置 SSL 超时 30s，防止网络卡死触发看门狗
@@ -696,6 +858,11 @@ void loop() {
   if (Serial.available()) Serial1.write(Serial.read());
   // 尝试保持 WiFi 连接
   ensureWiFiConnected();
+  if (rtConfig.enableHttp && rtConfig.smsWebMode &&
+      (millis() - lastSmsWebHeartbeat) >= SMS_WEB_HEARTBEAT_MS) {
+    lastSmsWebHeartbeat = millis();
+    sendSmsWebDeviceEvent(998);
+  }
   // 处理队列中的待重试短信
   processSMSQueue();
   // 检查URC和解析
@@ -856,6 +1023,8 @@ void ensureWiFiConnected() {
     Serial.println("WiFi 已重连");
     // reset interval
     wifiReconnectInterval = 5000;
+    sendSmsWebDeviceEvent(100);
+    lastSmsWebHeartbeat = millis();
   } else {
     // 增长间隔，最大 60s
     wifiReconnectInterval = min(wifiReconnectInterval * 2, 60000UL);
@@ -993,6 +1162,9 @@ void handleSend() {
     return;
   }
   bool ok = sendSMS(to.c_str(), msg.c_str());
+  if (ok && rtConfig.enableHttp && rtConfig.smsWebMode) {
+    sendSMSToServer(to.c_str(), msg.c_str(), NULL, 502);
+  }
   
   String html = getHeader("发送结果");
   html += "<div class='card' style='text-align:center'><h2>" + String(ok ? "✅ 发送成功" : "❌ 发送失败") + "</h2>";
@@ -1024,6 +1196,10 @@ void handleConfigGet() {
   html += "<hr style='margin:20px 0;border:0;border-top:1px solid #eee'>";
   html += "<label>HTTP 推送 URL</label><input name=\"httpurl\" value=\"" + htmlEncode(String(rtConfig.httpServerUrl)) + "\">";
   html += "<div class='check-group'><input type=\"checkbox\" name=\"enhttp\" " + String(rtConfig.enableHttp?"checked":"") + "><label class='checkbox-label'>启用 HTTP 推送</label></div>";
+  html += "<div class='check-group'><input type=\"checkbox\" name=\"smsweb\" " + String(rtConfig.smsWebMode?"checked":"") + "><label class='checkbox-label'>使用 sms_web 协议</label></div>";
+  html += "<label>sms_web API Key</label><input name=\"httpkey\" type=\"password\" value=\"" + htmlEncode(String(rtConfig.httpApiKey)) + "\">";
+  html += "<label>设备 ID</label><input name=\"deviceid\" value=\"" + htmlEncode(String(rtConfig.deviceId)) + "\">";
+  html += "<label>SIM 卡槽 (1/2)</label><input name=\"simslot\" type=\"number\" min=\"1\" max=\"2\" value=\"" + String(rtConfig.simSlot) + "\">";
 
   html += "<hr style='margin:20px 0;border:0;border-top:1px solid #eee'>";
   html += "<label>Web 管理员用户名</label><input name=\"webuser\" value=\"" + htmlEncode(String(rtConfig.webUser)) + "\">";
@@ -1031,6 +1207,10 @@ void handleConfigGet() {
 
   html += "<input type=\"submit\" value=\"保存配置\">";
   html += "</form></div>";
+  html += "<div class='card'><h2>恢复默认配置</h2>";
+  html += "<p>清空 NVS 后立即恢复 config.h 中的默认值，包括 Web 管理账号密码。</p>";
+  html += "<form method=\"POST\" action=\"/config/reset\" onsubmit=\"return confirm('确定清空 NVS 配置？');\">";
+  html += "<input type=\"submit\" style=\"background:#dc3545\" value=\"清空 NVS 并恢复默认\"></form></div>";
   html += getFooter();
   webServer.send(200, "text/html", html);
 }
@@ -1046,9 +1226,13 @@ void handleConfigPost() {
   String smtppass = webServer.arg("smtppass");
   String smtpto = webServer.arg("smtpto");
   String httpurl = webServer.arg("httpurl");
+  String httpkey = webServer.arg("httpkey");
+  String deviceid = webServer.arg("deviceid");
+  uint8_t simslot = constrain(webServer.arg("simslot").toInt(), 1, 2);
   bool enwecom = webServer.hasArg("enwecom");
   bool enemail = webServer.hasArg("enemail");
   bool enhttp = webServer.hasArg("enhttp");
+  bool smsweb = webServer.hasArg("smsweb");
   String webuser = webServer.arg("webuser");
   String webpass = webServer.arg("webpass");
 
@@ -1060,17 +1244,39 @@ void handleConfigPost() {
   strlcpy(rtConfig.smtpPass, smtppass.c_str(), sizeof(rtConfig.smtpPass));
   strlcpy(rtConfig.smtpTo, smtpto.c_str(), sizeof(rtConfig.smtpTo));
   strlcpy(rtConfig.httpServerUrl, httpurl.c_str(), sizeof(rtConfig.httpServerUrl));
+  strlcpy(rtConfig.httpApiKey, httpkey.c_str(), sizeof(rtConfig.httpApiKey));
+  if (deviceid.length()) strlcpy(rtConfig.deviceId, deviceid.c_str(), sizeof(rtConfig.deviceId));
+  rtConfig.simSlot = simslot;
   rtConfig.enableWecom = enwecom;
   rtConfig.enableEmail = enemail;
   rtConfig.enableHttp = enhttp;
+  rtConfig.smsWebMode = smsweb;
   strlcpy(rtConfig.webUser, webuser.c_str(), sizeof(rtConfig.webUser));
   strlcpy(rtConfig.webPass, webpass.c_str(), sizeof(rtConfig.webPass));
 
-  saveConfig();
-  String html = getHeader("保存成功");
-  html += "<div class='card' style='text-align:center'><h2>✅ 配置已保存</h2><p>新配置已生效。</p><p><a href='/config'>返回配置页</a></p></div>";
+  bool saved = saveConfig();
+  if (!saved) loadConfig(); // 写入失败时回到 NVS 中实际可读的状态
+  if (saved && rtConfig.enableHttp && rtConfig.smsWebMode) {
+    sendSmsWebDeviceEvent(100);
+    lastSmsWebHeartbeat = millis();
+  }
+  String html = getHeader(saved ? "保存成功" : "保存失败");
+  html += saved
+    ? "<div class='card' style='text-align:center'><h2>✅ 配置已保存</h2><p>NVS 写入和回读校验均成功，新配置已生效。</p><p><a href='/config'>返回配置页</a></p></div>"
+    : "<div class='card' style='text-align:center'><h2>❌ 配置保存失败</h2><p>NVS 写入或回读校验失败，请查看串口日志。</p><p><a href='/config'>返回配置页</a></p></div>";
   html += getFooter();
-  webServer.send(200, "text/html", html);
+  webServer.send(saved ? 200 : 500, "text/html", html);
+}
+
+void handleConfigReset() {
+  if (!checkAuth()) { requestAuth(); return; }
+  bool reset = resetConfig();
+  String html = getHeader(reset ? "已恢复默认配置" : "恢复失败");
+  html += reset
+    ? "<div class='card' style='text-align:center'><h2>✅ NVS 已清空</h2><p>已恢复 config.h 默认值。Web 账号密码也可能已改回默认值。</p><p><a href='/'>返回首页</a></p></div>"
+    : "<div class='card' style='text-align:center'><h2>❌ NVS 清空失败</h2><p>请查看串口日志。</p><p><a href='/config'>返回配置页</a></p></div>";
+  html += getFooter();
+  webServer.send(reset ? 200 : 500, "text/html", html);
 }
 
 // 队列查看页面
@@ -1131,6 +1337,56 @@ void handleSimulateReceive() {
   webServer.send(200, "text/html", html);
 }
 
+String controlToken() {
+  MD5Builder md5;
+  md5.begin();
+  md5.add(String(rtConfig.webUser) + "|" + rtConfig.webPass);
+  md5.calculate();
+  return md5.toString();
+}
+
+// sms_web 会以 GET /ctrl?token=...&cmd=sendsms&p1=...&p2=...&p3=... 控制开发板。
+// 仅实现本单卡短信硬件有意义的命令，避免为不存在的 X 系列功能浪费 Flash/RAM。
+void handleCtrl() {
+  if (!webServer.hasArg("token") || webServer.arg("token") != controlToken()) {
+    webServer.send(403, "application/json", "{\"code\":-1,\"message\":\"invalid token\"}");
+    return;
+  }
+
+  String cmd = webServer.arg("cmd");
+  if (cmd == "ping" || cmd == "stat") {
+    String response;
+    response.reserve(160);
+    response = "{\"code\":0,\"devId\":\"" + escapeJson(rtConfig.deviceId);
+    response += "\",\"ip\":\"" + WiFi.localIP().toString();
+    response += "\",\"slot\":" + String(rtConfig.simSlot);
+    response += ",\"dbm\":" + String(WiFi.RSSI());
+    response += ",\"freeHeap\":" + String(ESP.getFreeHeap()) + "}";
+    webServer.send(200, "application/json", response);
+    return;
+  }
+
+  if (cmd == "sendsms") {
+    String phone = webServer.arg("p2");
+    String content = webServer.arg("p3");
+    int slot = webServer.arg("p1").toInt();
+    if (!phone.length() || !content.length() || slot != rtConfig.simSlot) {
+      webServer.send(400, "application/json", "{\"code\":-1,\"message\":\"invalid sms parameters or slot\"}");
+      return;
+    }
+    bool ok = sendSMS(phone.c_str(), content.c_str());
+    if (ok && rtConfig.enableHttp && rtConfig.smsWebMode) {
+      String tid = webServer.arg("tid");
+      sendSMSToServer(phone.c_str(), content.c_str(), NULL, 502, tid.c_str());
+    }
+    webServer.send(ok ? 200 : 500, "application/json",
+                   ok ? "{\"code\":0,\"message\":\"OK\"}" : "{\"code\":-1,\"message\":\"send failed\"}");
+    return;
+  }
+
+  webServer.send(400, "application/json", "{\"code\":-1,\"message\":\"unsupported command\"}");
+}
+
 // 初始化 Web 路由
 void setupWebServer() {
   webServer.on("/", HTTP_GET, handleRoot);
@@ -1138,7 +1394,9 @@ void setupWebServer() {
   webServer.on("/simulate", HTTP_POST, handleSimulateReceive);
   webServer.on("/config", HTTP_GET, handleConfigGet);
   webServer.on("/config", HTTP_POST, handleConfigPost);
+  webServer.on("/config/reset", HTTP_POST, handleConfigReset);
   webServer.on("/queue", HTTP_GET, handleQueue);
+  webServer.on("/ctrl", HTTP_GET, handleCtrl);
   webServer.begin();
   Serial.println("Web 服务器已启动");
 }
